@@ -1,0 +1,34 @@
+services:
+  mqtt-proxy:
+    build: .
+    container_name: mqtt-proxy
+    restart: unless-stopped
+    ports:
+      - "9883:1883"
+    environment:
+      # Host to listen on (default: 0.0.0.0)
+      - LISTEN_HOST=0.0.0.0
+      # Port to accept plain MQTT connections
+      - LISTEN_PORT=1883
+      # Target MQTT broker hostname (CHANGE THIS)
+      - TARGET_HOST=iot.teknykar.com
+      # Target port (TLS)
+      - TARGET_PORT=8883
+      # Verify SSL certificate (set to 'false' for self-signed certs)
+      - VERIFY_SSL=true
+      # Optional: Path to CA certificate file inside container
+      - CA_CERT_PATH=/certs/ca.pem
+    volumes:
+      # Mount your CA certificate if needed
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 1883)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
