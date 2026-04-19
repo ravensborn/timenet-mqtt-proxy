@@ -2,7 +2,7 @@
 """
 MQTT Proxy Service
 Accepts plain MQTT connections on port 1883 and forwards them to a TLS-secured broker on port 8883.
-Includes MQTT packet parsing for debugging.
+Includes MQTT packet parsing for debugging and credential injection.
 """
 
 import asyncio
@@ -25,6 +25,10 @@ TARGET_HOST = os.getenv('TARGET_HOST', 'mqtt.example.com')
 TARGET_PORT = int(os.getenv('TARGET_PORT', '8883'))
 VERIFY_SSL = os.getenv('VERIFY_SSL', 'true').lower() == 'true'
 CA_CERT_PATH = os.getenv('CA_CERT_PATH', '')
+
+# Default credentials to inject if client doesn't provide them
+DEFAULT_USERNAME = os.getenv('DEFAULT_USERNAME', '')
+DEFAULT_PASSWORD = os.getenv('DEFAULT_PASSWORD', '')
 
 # MQTT Packet Types
 MQTT_PACKET_TYPES = {
@@ -55,6 +59,12 @@ CONNACK_CODES = {
 }
 
 
+def encode_string(s):
+    """Encode a string as MQTT UTF-8 string (length prefix + bytes)."""
+    encoded = s.encode('utf-8')
+    return struct.pack('!H', len(encoded)) + encoded
+
+
 def decode_remaining_length(data, offset):
     """Decode MQTT remaining length field."""
     multiplier = 1
@@ -70,6 +80,20 @@ def decode_remaining_length(data, offset):
     return value, idx
 
 
+def encode_remaining_length(length):
+    """Encode remaining length as MQTT variable length field."""
+    result = bytearray()
+    while True:
+        byte = length % 128
+        length //= 128
+        if length > 0:
+            byte |= 0x80
+        result.append(byte)
+        if length == 0:
+            break
+    return bytes(result)
+
+
 def decode_string(data, offset):
     """Decode MQTT UTF-8 string."""
     if offset + 2 > len(data):
@@ -80,6 +104,102 @@ def decode_string(data, offset):
         return None, offset
     string = data[offset:offset+length].decode('utf-8', errors='replace')
     return string, offset + length
+
+
+def inject_credentials(data):
+    """
+    Parse MQTT CONNECT packet and inject default credentials if missing.
+    Returns modified packet or original if no injection needed.
+    """
+    if len(data) < 2:
+        return data
+    
+    packet_type = (data[0] & 0xF0) >> 4
+    if packet_type != 1:  # Not a CONNECT packet
+        return data
+    
+    if not DEFAULT_USERNAME:
+        return data  # No default credentials configured
+    
+    try:
+        offset = 0
+        fixed_header_byte = data[0]
+        
+        # Remaining length
+        remaining_length, offset = decode_remaining_length(data, 1)
+        variable_header_start = offset
+        
+        # Protocol name
+        protocol_name, offset = decode_string(data, offset)
+        
+        # Protocol level
+        protocol_level = data[offset]
+        offset += 1
+        
+        # Connect flags
+        connect_flags = data[offset]
+        connect_flags_offset = offset
+        offset += 1
+        
+        has_username = bool(connect_flags & 0x80)
+        has_password = bool(connect_flags & 0x40)
+        
+        # Always inject default credentials, overriding any client-provided ones
+        if has_username:
+            logger.info(f"Overriding client credentials with default (username: {DEFAULT_USERNAME})")
+        else:
+            logger.info(f"Injecting default credentials (username: {DEFAULT_USERNAME})")
+        
+        # Keep alive
+        keep_alive = struct.unpack('!H', data[offset:offset+2])[0]
+        offset += 2
+        
+        # Client ID
+        client_id, offset = decode_string(data, offset)
+        
+        # Will topic and message (skip if present)
+        has_will = bool(connect_flags & 0x04)
+        if has_will:
+            will_topic, offset = decode_string(data, offset)
+            will_message, offset = decode_string(data, offset)
+        
+        # Build new packet
+        # Variable header: protocol name + level + flags + keepalive
+        new_connect_flags = connect_flags | 0x80 | 0x40  # Set username and password flags
+        
+        # Rebuild variable header
+        new_variable_header = bytearray()
+        new_variable_header += encode_string(protocol_name)
+        new_variable_header.append(protocol_level)
+        new_variable_header.append(new_connect_flags)
+        new_variable_header += struct.pack('!H', keep_alive)
+        
+        # Payload: client_id + [will_topic + will_message] + username + password
+        new_payload = bytearray()
+        new_payload += encode_string(client_id)
+        
+        if has_will:
+            new_payload += encode_string(will_topic)
+            new_payload += encode_string(will_message)
+        
+        new_payload += encode_string(DEFAULT_USERNAME)
+        new_payload += encode_string(DEFAULT_PASSWORD)
+        
+        # Calculate new remaining length
+        new_remaining_length = len(new_variable_header) + len(new_payload)
+        
+        # Build complete new packet
+        new_packet = bytearray()
+        new_packet.append(fixed_header_byte)
+        new_packet += encode_remaining_length(new_remaining_length)
+        new_packet += new_variable_header
+        new_packet += new_payload
+        
+        return bytes(new_packet)
+        
+    except Exception as e:
+        logger.error(f"Error injecting credentials: {e}")
+        return data
 
 
 def parse_connect_packet(data):
@@ -342,13 +462,19 @@ class MQTTProxy:
         
         return ssl_context
     
-    async def pipe(self, reader, writer, direction, client_addr):
+    async def pipe(self, reader, writer, direction, client_addr, modify_connect=False):
         """Pipe data from reader to writer with MQTT packet logging."""
         try:
             while True:
                 data = await reader.read(4096)
                 if not data:
                     break
+                
+                # Inject credentials into CONNECT packets going upstream
+                if modify_connect and len(data) > 0:
+                    packet_type = (data[0] & 0xF0) >> 4
+                    if packet_type == 1:  # CONNECT packet
+                        data = inject_credentials(data)
                 
                 # Log MQTT packet details
                 log_mqtt_packet(data, direction, client_addr)
@@ -387,11 +513,12 @@ class MQTTProxy:
             self.connections.add(connection_info)
             
             # Create bidirectional pipes with logging
+            # modify_connect=True for client->upstream to inject credentials
             client_to_upstream = asyncio.create_task(
-                self.pipe(client_reader, upstream_writer, "→ SEND", client_addr)
+                self.pipe(client_reader, upstream_writer, "→ SEND", client_addr, modify_connect=True)
             )
             upstream_to_client = asyncio.create_task(
-                self.pipe(upstream_reader, client_writer, "← RECV", client_addr)
+                self.pipe(upstream_reader, client_writer, "← RECV", client_addr, modify_connect=False)
             )
             
             # Wait for either direction to complete
@@ -440,6 +567,8 @@ class MQTTProxy:
         addr = self.server.sockets[0].getsockname()
         logger.info(f"MQTT Proxy listening on {addr[0]}:{addr[1]}")
         logger.info(f"Forwarding to {TARGET_HOST}:{TARGET_PORT} (TLS)")
+        if DEFAULT_USERNAME:
+            logger.info(f"Default credentials configured (username: {DEFAULT_USERNAME})")
         
         async with self.server:
             await self.server.serve_forever()
