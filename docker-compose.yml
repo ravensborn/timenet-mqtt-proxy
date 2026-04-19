@@ -19,8 +19,8 @@ services:
       # Optional: Path to CA certificate file inside container
       - CA_CERT_PATH=/certs/ca.pem
       # Username and password to be injected
-      - DEFAULT_USERNAME=F87BF3FF59C4
-      - DEFAULT_PASSWORD=37b9321e834f
+      - DEFAULT_USERNAME=${DEFAULT_USERNAME}
+      - DEFAULT_PASSWORD=${DEFAULT_PASSWORD}
     volumes:
       # Mount your CA certificate if needed
       - ./certs:/certs:ro
