@@ -57,6 +57,16 @@ INDEX_FIELD_CANDIDATES = [
     ).split(',') if f.strip()
 ]
 
+# --- One-shot downward command (e.g. clear data flash) ----------------------
+# When set, the proxy sends this command ONCE to each device, the first time that device
+# publishes (i.e. the moment it is known to be connected and subscribed), then reverts to
+# normal ACK-only behaviour. Leave blank to disable.
+#   Clear stored data flash (TT18 cmd 500):  @CMD,*000000,500#,#   <- safe remotely
+#   Reboot (TT18 cmd 991):                   @CMD,*000000,991#,#
+#   Do NOT send initialization/factory reset (990) remotely: it wipes the server target,
+#   so the device would reconnect to Tzone's default cloud instead of this proxy.
+ONESHOT_COMMAND = os.getenv('ONESHOT_COMMAND', '')
+
 # MQTT Packet Types
 MQTT_PACKET_TYPES = {
     1: 'CONNECT', 2: 'CONNACK', 3: 'PUBLISH', 4: 'PUBACK', 5: 'PUBREC',
@@ -431,6 +441,7 @@ class MQTTProxy:
     def __init__(self):
         self.connections = set()
         self.server = None
+        self.oneshot_sent = set()
 
     def create_ssl_context(self):
         ssl_context = ssl.create_default_context()
@@ -478,6 +489,23 @@ class MQTTProxy:
         logger.info(f"[{client_addr[0]}:{client_addr[1]}] \u2190 ACK to device: "
                     f"topic='{ack_topic}' payload={ack_payload!r} (index={index}, qos={ACK_QOS})")
 
+    async def maybe_send_oneshot(self, ack_writer, client_addr, packet):
+        """Send ONESHOT_COMMAND to a device once, on its uplink topic, then never again."""
+        if not ONESHOT_COMMAND:
+            return
+        try:
+            topic, _ = mqtt_publish_topic_payload(packet)
+        except Exception:
+            return
+        if topic in self.oneshot_sent:
+            return
+        self.oneshot_sent.add(topic)
+        cmd_packet = build_mqtt_publish(topic, ONESHOT_COMMAND.encode('utf-8'), qos=ACK_QOS)
+        ack_writer.write(cmd_packet)
+        await ack_writer.drain()
+        logger.info(f"[{client_addr[0]}:{client_addr[1]}] \u2190 ONE-SHOT command to device: "
+                    f"topic='{topic}' payload={ONESHOT_COMMAND!r} (will not repeat for this topic)")
+
     async def pipe(self, reader, writer, direction, client_addr,
                    modify_connect=False, ack_writer=None):
         """Pipe data from reader to writer with MQTT packet logging and optional app-layer ACK."""
@@ -508,6 +536,7 @@ class MQTTProxy:
                     for pkt in packets:
                         if ((pkt[0] & 0xF0) >> 4) == 3:  # PUBLISH from device
                             await self.send_app_ack(ack_writer, client_addr, pkt)
+                            await self.maybe_send_oneshot(ack_writer, client_addr, pkt)
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             pass
         except Exception as e:
@@ -582,6 +611,9 @@ class MQTTProxy:
         if ENABLE_MQTT_ACK:
             logger.info(f"App-layer ACK enabled (template='{ACK_TEMPLATE}', qos={ACK_QOS}, "
                         f"topic={'<same as publish>' if not ACK_TOPIC_OVERRIDE else ACK_TOPIC_OVERRIDE})")
+        if ONESHOT_COMMAND:
+            logger.warning(f"ONE-SHOT command armed: {ONESHOT_COMMAND!r} - will be sent ONCE per "
+                           f"device topic. Disable (unset ONESHOT_COMMAND) and restart after both fire.")
         if DEFAULT_USERNAME:
             logger.info(f"Default credentials configured (username: {DEFAULT_USERNAME})")
         async with self.server:
