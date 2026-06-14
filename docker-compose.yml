@@ -21,7 +21,7 @@ services:
       # Username and password to be injected
       - DEFAULT_USERNAME=${DEFAULT_USERNAME}
       - DEFAULT_PASSWORD=${DEFAULT_PASSWORD}
-      - ONESHOT_COMMAND=${ONESHOT_COMMAND}
+      # - ONESHOT_COMMAND=${ONESHOT_COMMAND}
     volumes:
       # Mount your CA certificate if needed
       - ./certs:/certs:ro
