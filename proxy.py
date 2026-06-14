@@ -65,7 +65,15 @@ INDEX_FIELD_CANDIDATES = [
 #   Reboot (TT18 cmd 991):                   @CMD,*000000,991#,#
 #   Do NOT send initialization/factory reset (990) remotely: it wipes the server target,
 #   so the device would reconnect to Tzone's default cloud instead of this proxy.
-ONESHOT_COMMAND = os.getenv('ONESHOT_COMMAND', '')
+ONESHOT_COMMAND = os.getenv('ONESHOT_COMMAND', '@CMD,*000000,500#,#').strip().strip('"').strip("'")
+if ONESHOT_COMMAND and not ONESHOT_COMMAND.endswith('#'):
+    logger.warning(
+        f"ONESHOT_COMMAND={ONESHOT_COMMAND!r} does not end with '#'. It was probably truncated by "
+        f"a '#' treated as a comment in your env/.env/Dokploy config. Quote the whole value."
+    )
+# REQUIRED to arm the one-shot: comma-separated IMEIs to target. Empty = nothing is sent.
+# The IMEI is read from each device's publish payload.
+ONESHOT_IMEIS = set(s.strip() for s in os.getenv('ONESHOT_IMEIS', '').split(',') if s.strip())
 
 # MQTT Packet Types
 MQTT_PACKET_TYPES = {
@@ -445,9 +453,17 @@ class MQTTProxy:
 
     def create_ssl_context(self):
         ssl_context = ssl.create_default_context()
-        if CA_CERT_PATH and os.path.exists(CA_CERT_PATH):
-            ssl_context.load_verify_locations(CA_CERT_PATH)
-            logger.info(f"Loaded CA certificate from {CA_CERT_PATH}")
+        if CA_CERT_PATH:
+            if os.path.exists(CA_CERT_PATH):
+                ssl_context.load_verify_locations(CA_CERT_PATH)
+                logger.info(f"Loaded CA certificate from {CA_CERT_PATH}")
+            else:
+                logger.error(
+                    f"CA_CERT_PATH={CA_CERT_PATH} is set but the file is MISSING inside the "
+                    f"container. TLS will fall back to system CAs and the upstream handshake will "
+                    f"likely fail. The cert should be baked in via 'COPY certs /certs' - check that "
+                    f"a volume mount (e.g. ./certs:/certs) isn't shadowing it at runtime."
+                )
         if not VERIFY_SSL:
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
@@ -490,21 +506,37 @@ class MQTTProxy:
                     f"topic='{ack_topic}' payload={ack_payload!r} (index={index}, qos={ACK_QOS})")
 
     async def maybe_send_oneshot(self, ack_writer, client_addr, packet):
-        """Send ONESHOT_COMMAND to a device once, on its uplink topic, then never again."""
-        if not ONESHOT_COMMAND:
+        """Send ONESHOT_COMMAND once per device, restricted to ONESHOT_IMEIS.
+        If ONESHOT_IMEIS is empty, the one-shot is inert and nothing is sent."""
+        if not ONESHOT_COMMAND or not ONESHOT_IMEIS:
             return
         try:
-            topic, _ = mqtt_publish_topic_payload(packet)
+            topic, payload = mqtt_publish_topic_payload(packet)
         except Exception:
             return
-        if topic in self.oneshot_sent:
+
+        # Identify the device by IMEI from the publish payload.
+        imei = None
+        try:
+            obj = json.loads(payload.decode('utf-8', errors='replace').strip().rstrip('\x00').strip())
+            if isinstance(obj, dict) and obj.get('imei') is not None:
+                imei = str(obj['imei'])
+        except Exception:
+            pass
+
+        # Only act on explicitly targeted IMEIs.
+        if imei is None or imei not in ONESHOT_IMEIS:
             return
-        self.oneshot_sent.add(topic)
+
+        if imei in self.oneshot_sent:
+            return
+        self.oneshot_sent.add(imei)
+
         cmd_packet = build_mqtt_publish(topic, ONESHOT_COMMAND.encode('utf-8'), qos=ACK_QOS)
         ack_writer.write(cmd_packet)
         await ack_writer.drain()
-        logger.info(f"[{client_addr[0]}:{client_addr[1]}] \u2190 ONE-SHOT command to device: "
-                    f"topic='{topic}' payload={ONESHOT_COMMAND!r} (will not repeat for this topic)")
+        logger.info(f"[{client_addr[0]}:{client_addr[1]}] \u2190 ONE-SHOT command to device "
+                    f"(imei={imei}): topic='{topic}' payload={ONESHOT_COMMAND!r} (will not repeat)")
 
     async def pipe(self, reader, writer, direction, client_addr,
                    modify_connect=False, ack_writer=None):
@@ -608,12 +640,20 @@ class MQTTProxy:
         addr = self.server.sockets[0].getsockname()
         logger.info(f"MQTT Proxy listening on {addr[0]}:{addr[1]}")
         logger.info(f"Forwarding to {TARGET_HOST}:{TARGET_PORT} (TLS)")
+        if CA_CERT_PATH and not os.path.exists(CA_CERT_PATH):
+            logger.error(f"STARTUP CHECK: CA_CERT_PATH={CA_CERT_PATH} not found in container - "
+                         f"upstream TLS will probably fail. See create_ssl_context warning.")
+        elif CA_CERT_PATH:
+            logger.info(f"STARTUP CHECK: CA certificate present at {CA_CERT_PATH}")
         if ENABLE_MQTT_ACK:
             logger.info(f"App-layer ACK enabled (template='{ACK_TEMPLATE}', qos={ACK_QOS}, "
                         f"topic={'<same as publish>' if not ACK_TOPIC_OVERRIDE else ACK_TOPIC_OVERRIDE})")
-        if ONESHOT_COMMAND:
-            logger.warning(f"ONE-SHOT command armed: {ONESHOT_COMMAND!r} - will be sent ONCE per "
-                           f"device topic. Disable (unset ONESHOT_COMMAND) and restart after both fire.")
+        if ONESHOT_IMEIS:
+            logger.warning(f"ONE-SHOT command armed: {ONESHOT_COMMAND!r} -> targets: "
+                           f"{', '.join(sorted(ONESHOT_IMEIS))}. Sent ONCE per device; "
+                           f"clear ONESHOT_IMEIS and restart after it fires.")
+        else:
+            logger.info("One-shot is INERT (ONESHOT_IMEIS is empty - no devices targeted).")
         if DEFAULT_USERNAME:
             logger.info(f"Default credentials configured (username: {DEFAULT_USERNAME})")
         async with self.server:
