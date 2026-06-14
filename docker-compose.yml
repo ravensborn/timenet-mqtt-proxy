@@ -22,7 +22,7 @@ services:
       - DEFAULT_USERNAME=${DEFAULT_USERNAME}
       - DEFAULT_PASSWORD=${DEFAULT_PASSWORD}
       # One-shot downward command, e.g. clear data flash. Leave unset for normal operation.
-      # - ONESHOT_COMMAND=${ONESHOT_COMMAND}
+      - ONESHOT_COMMAND=${ONESHOT_COMMAND}
 
     # NOTE: no ./certs volume mount on purpose.
     # The cert is committed to the repo and baked into the image via "COPY certs /certs".
