@@ -21,8 +21,12 @@ services:
       # Username and password to be injected
       - DEFAULT_USERNAME=${DEFAULT_USERNAME}
       - DEFAULT_PASSWORD=${DEFAULT_PASSWORD}
-      # One-shot downward command, e.g. clear data flash. Leave unset for normal operation.
-      # - ONESHOT_COMMAND=${ONESHOT_COMMAND}
+      # --- Clear the data-flash backlog ONCE per device, then RESTART the proxy ---
+      # List the IMEIs to clear (comma-separated). That's all that's needed - the default
+      # command is "clear data flash". Empty/unset = nothing is sent.
+      # - ONESHOT_IMEIS=180325000001092,180325000001093
+      # Optional: override the command (QUOTE it so the '#' survives), e.g. reboot:
+      # - "ONESHOT_COMMAND=@CMD,*000000,991#,#"
 
     # NOTE: no ./certs volume mount on purpose.
     # The cert is committed to the repo and baked into the image via "COPY certs /certs".
