@@ -16,15 +16,22 @@ services:
       - TARGET_PORT=8883
       # Verify SSL certificate (set to 'false' for self-signed certs)
       - VERIFY_SSL=true
-      # Optional: Path to CA certificate file inside container
+      # CA certificate is baked into the image by the Dockerfile (COPY certs /certs).
       - CA_CERT_PATH=/certs/ca.pem
       # Username and password to be injected
       - DEFAULT_USERNAME=${DEFAULT_USERNAME}
       - DEFAULT_PASSWORD=${DEFAULT_PASSWORD}
+      # One-shot downward command, e.g. clear data flash. Leave unset for normal operation.
       # - ONESHOT_COMMAND=${ONESHOT_COMMAND}
-    volumes:
-      # Mount your CA certificate if needed
-      - ./certs:/certs:ro
+
+    # NOTE: no ./certs volume mount on purpose.
+    # The cert is committed to the repo and baked into the image via "COPY certs /certs".
+    # A relative bind mount (./certs:/certs:ro) does NOT resolve to the cloned repo dir under
+    # Dokploy, so it overlays an empty directory on top of /certs and hides ca.pem at runtime.
+    # If you ever need to override the cert without rebuilding, mount an ABSOLUTE host path:
+    #   volumes:
+    #     - /opt/timenet/certs:/certs:ro
+
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 1883)); s.close()"]
       interval: 30s
